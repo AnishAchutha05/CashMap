@@ -1,4 +1,4 @@
-# CashMap (SplitEase)
+# CashMap
 
 A Splitwise-style shared expense tracker — log group expenses, split them fairly, and settle up with the **minimum number of transactions** needed to clear everyone's debts.
 
