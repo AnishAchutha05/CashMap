@@ -1,0 +1,9 @@
+services:
+  database:
+    image: postgres:13
+    environment:
+      USER : myuser
+      PASSWORD: mypassword
+      DB_NAME: splitease
+
+    

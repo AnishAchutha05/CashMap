@@ -1,0 +1,335 @@
+# SplitEase — Complete Backend Technical Specification
+
+Scope: backend only (FastAPI core API + notification worker). Frontend excluded — build and verify entirely through Swagger UI (`/docs`) and browser  devtools against raw HTTP calls (curl/Postman/httpie also fine).
+
+---
+
+## 1. High-Level Architecture
+
+```
+                 ┌─────────────┐
+   Client ─────▶ │  Core API   │──────▶ PostgreSQL (Cloud SQL)
+ (Swagger/curl)  │  (FastAPI)  │──────▶ Redis (cache + pub/sub)
+                 └─────┬───────┘
+                       │ publishes events
+                       ▼
+                 ┌─────────────┐
+                 │ Notification │
+                 │   Worker     │──────▶ (logs/prints email instead
+                 │ (subscriber) │         of real SMTP for v1)
+                 └─────────────┘
+```
+
+Two independently deployable services sharing one Postgres instance and one Redis instance:
+
+1. **core-api** — all synchronous REST endpoints. Owns all writes to Postgres.
+2. **notification-worker** — a standalone Python process (not a web server) that subscribes to a Redis Pub/Sub channel and reacts to events (new expense, settlement made) by "sending" a notification (for v1: log it clearly, structured, as if it were an email — no real SMTP needed to prove the pattern).
+
+They never call each other directly. All communication is core-api → Redis → worker. This is your async messaging / service-boundary story.
+
+---
+
+## 2. Database Schema (PostgreSQL)
+
+Use SQLAlchemy models + Alembic for migrations. Every table gets `id` (UUID, primary key, `gen_random_uuid()` via `pgcrypto` or `uuid-ossp`), `created_at`, `updated_at` (both `TIMESTAMPTZ`, default `now()`).
+
+### 2.1 `users`
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| email | VARCHAR(255) | UNIQUE, NOT NULL |
+| hashed_password | VARCHAR(255) | NOT NULL |
+| full_name | VARCHAR(100) | NOT NULL |
+| created_at / updated_at | TIMESTAMPTZ | default now() |
+
+Index: unique index on `email` (case-insensitive — store lowercased, or use `citext`).
+
+### 2.2 `groups`
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| name | VARCHAR(100) | NOT NULL |
+| created_by | UUID | FK → users.id, NOT NULL |
+| invite_code | VARCHAR(10) | UNIQUE, NOT NULL — random alphanumeric, generated on create |
+| created_at / updated_at | | |
+
+### 2.3 `group_members` (join table)
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| group_id | UUID | FK → groups.id, NOT NULL, ON DELETE CASCADE |
+| user_id | UUID | FK → users.id, NOT NULL, ON DELETE CASCADE |
+| joined_at | TIMESTAMPTZ | default now() |
+
+Constraint: `UNIQUE(group_id, user_id)` — a user can't join the same group twice.
+
+### 2.4 `expenses`
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| group_id | UUID | FK → groups.id, NOT NULL |
+| paid_by | UUID | FK → users.id, NOT NULL — who fronted the money |
+| description | VARCHAR(255) | NOT NULL |
+| amount | NUMERIC(10,2) | NOT NULL, CHECK (amount > 0) |
+| split_type | VARCHAR(20) | NOT NULL, CHECK IN ('equal','percentage','exact') |
+| expense_date | DATE | NOT NULL, default current_date |
+| version | INTEGER | NOT NULL, default 1 — **optimistic locking column** |
+| created_at / updated_at | | |
+
+**Never store `amount_owed` per-person on this table** — that lives in `expense_splits` (below), which is the source of truth for balance calculation.
+
+### 2.5 `expense_splits`
+One row per (expense, participant) — how much of that expense each person owes.
+
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| expense_id | UUID | FK → expenses.id, NOT NULL, ON DELETE CASCADE |
+| user_id | UUID | FK → users.id, NOT NULL |
+| amount_owed | NUMERIC(10,2) | NOT NULL, CHECK (amount_owed >= 0) |
+
+Constraint: `UNIQUE(expense_id, user_id)`.
+**Invariant you must enforce in application code**: `SUM(amount_owed) for a given expense_id == expenses.amount` exactly (down to the cent). This is where rounding logic lives — see §4.
+
+### 2.6 `settlements`
+Records a payment made to clear (part of) a debt between two users in a group.
+
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| group_id | UUID | FK → groups.id, NOT NULL |
+| paid_by | UUID | FK → users.id, NOT NULL — the debtor, who is paying |
+| paid_to | UUID | FK → users.id, NOT NULL — the creditor, receiving |
+| amount | NUMERIC(10,2) | NOT NULL, CHECK (amount > 0) |
+| settled_at | TIMESTAMPTZ | default now() |
+
+### 2.7 `refresh_tokens`
+| column | type | constraints |
+|---|---|---|
+| id | UUID | PK |
+| user_id | UUID | FK → users.id, NOT NULL, ON DELETE CASCADE |
+| token_hash | VARCHAR(255) | NOT NULL — store a hash of the refresh token, never plaintext |
+| expires_at | TIMESTAMPTZ | NOT NULL |
+| revoked | BOOLEAN | default false |
+| created_at | | |
+
+Rationale for a DB table instead of pure stateless JWT refresh: lets you revoke on logout and detect reuse (security best practice worth mentioning in interviews).
+
+---
+
+## 3. Auth System
+
+- **Password hashing**: `bcrypt` via `passlib` — never store plaintext, never use a fast hash like SHA256 alone.
+- **Access token**: JWT, short-lived (15 min), signed HS256 with a secret from env/Secret Manager. Payload: `{sub: user_id, exp, iat}`.
+- **Refresh token**: opaque random string (not JWT), long-lived (7–30 days), hashed and stored in `refresh_tokens`. Client sends it to `/auth/refresh` to get a new access token. Rotate on every use (issue new refresh token, revoke old one) — prevents replay.
+- **Endpoints**:
+  - `POST /auth/register` → `{email, password, full_name}` → 201, returns user (no tokens — force login).
+  - `POST /auth/login` → `{email, password}` → 200, `{access_token, refresh_token, token_type: "bearer"}`.
+  - `POST /auth/refresh` → `{refresh_token}` → 200, new token pair.
+  - `POST /auth/logout` → revoke the given refresh token → 204.
+- **Protected routes**: FastAPI dependency `get_current_user` that decodes the JWT from `Authorization: Bearer <token>`, 401 on invalid/expired.
+
+---
+
+## 4. Split Calculation Logic (the part interviewers poke at)
+
+Given an expense of `amount` and a list of `participants`:
+
+**Equal split**: `amount / n`, rounded to 2 decimals. Because this rarely divides evenly (₹100 / 3 = 33.333...), decide a deterministic remainder rule and document it:
+- Compute `base = floor(amount * 100 / n) / 100` per person.
+- Compute `remainder_cents = round(amount * 100) - base_cents * n`.
+- Distribute the leftover cents one-by-one to the first `remainder_cents` participants (sorted by user_id for determinism), each getting `base + 0.01`.
+- This guarantees `SUM(splits) == amount` exactly, every time.
+
+**Percentage split**: client sends `{user_id, percentage}` pairs summing to 100 (validate this — reject with 422 if not, allow a small epsilon like 0.01 for float slop). Compute `amount * percentage / 100`, round to 2dp per person, then apply the **same leftover-cent distribution rule** as equal split to fix rounding drift so the sum matches exactly.
+
+**Exact split**: client sends `{user_id, amount_owed}` pairs. Validate `SUM(amount_owed) == expenses.amount` exactly (to the cent) — reject with 422 otherwise. No rounding logic needed since the client already committed to exact numbers.
+
+Write this as a **pure function** (`calculate_splits(amount, split_type, participants) -> list[SplitLine]`) with no DB/HTTP dependencies — this is your easiest, highest-value unit test target. Test cases to write: even division, uneven division (₹100/3), single participant, percentage summing to exactly 100, percentage with float rounding (33.33+33.33+33.34), exact split matching, exact split mismatch (should raise).
+
+---
+
+## 5. Balance Calculation
+
+For a given group, compute **net balance per user**:
+
+```
+net_balance[user] = SUM(expense_splits.amount_owed WHERE paid_by == user, across all group expenses... )
+```
+
+More precisely, for each expense:
+- The payer is owed `amount - their_own_split` by the group (they fronted it).
+- Every other participant owes their `amount_owed`.
+
+Simplify as a ledger approach:
+```python
+balances = defaultdict(Decimal)  # user_id -> net (positive = owed to them, negative = they owe)
+
+for expense in group_expenses:
+    balances[expense.paid_by] += expense.amount
+    for split in expense.splits:
+        balances[split.user_id] -= split.amount_owed
+
+for settlement in group_settlements:
+    balances[settlement.paid_by] += settlement.amount   # they paid down their debt
+    balances[settlement.paid_to] -= settlement.amount   # they received, so owed less
+```
+
+At the end, `sum(balances.values())` must equal 0 (within floating-point/decimal epsilon) — this is a great **sanity-check assertion** to put in a test and even as a runtime assertion in dev.
+
+**Cache this** in Redis: key `balances:{group_id}`, value = JSON of the balances dict, TTL optional (or no TTL, rely on invalidation). Invalidate (delete the key) on: new expense created, expense edited/deleted, new settlement created. Recompute lazily on next read (cache-aside pattern).
+
+---
+
+## 6. Debt Simplification Algorithm
+
+Goal: given net balances, produce the **minimum number of transactions** to zero everyone out.
+
+Greedy approach (this is your algorithmic talking point):
+
+1. Split users into two lists: `creditors` (balance > 0, owed money) and `debtors` (balance < 0, owe money).
+2. Turn each into a max-heap: creditors by balance descending, debtors by `abs(balance)` descending.
+3. Loop while both heaps are non-empty:
+   - Pop the largest creditor and largest debtor.
+   - `settle_amount = min(creditor_balance, debtor_balance)`.
+   - Record transaction: `debtor pays settle_amount to creditor`.
+   - Subtract `settle_amount` from both.
+   - If creditor balance > 0, push back onto creditor heap. Same for debtor.
+4. Continue until both heaps empty.
+
+This is provably not always the mathematically absolute minimum for arbitrary cases (that's an NP-hard variant), but the greedy largest-first approach is what Splitwise itself effectively does and is the industry-standard answer — say exactly this in interviews, it shows depth rather than overclaiming optimality.
+
+Endpoint: `GET /groups/{group_id}/simplify-debts` → returns list of `{from_user, to_user, amount}`. This is a **read-only, computed** endpoint — it does not create settlement records; the user still has to explicitly confirm each payment via the settle-up endpoint.
+
+Use Python's `heapq` (min-heap, negate values for max-heap behavior). Unit test with a 4–5 person scenario where you can hand-verify the expected transaction count.
+
+---
+
+## 7. Concurrency Handling
+
+Two people adding expenses to the same group simultaneously should never corrupt balances. Two mechanisms:
+
+1. **DB transactions**: every write endpoint (create expense, create settlement) wraps the insert + related rows in a single `db.begin()` transaction — either all rows commit or none do.
+2. **Optimistic locking** on `expenses.version`: when *editing* an expense, the update statement is:
+   ```sql
+   UPDATE expenses SET amount = :amount, version = version + 1
+   WHERE id = :id AND version = :expected_version
+   ```
+   If `rowcount == 0`, someone else modified it first → return `409 Conflict` with a message telling the client to refetch and retry. (Balance reads are eventually-consistent via cache invalidation, so this matters most for edit/delete of expenses, not creation.)
+
+---
+
+## 8. REST API — Full Endpoint List
+
+All routes prefixed `/api/v1`. All protected routes require `Authorization: Bearer <access_token>`.
+
+### Auth
+- `POST /auth/register`
+- `POST /auth/login`
+- `POST /auth/refresh`
+- `POST /auth/logout`
+
+### Users
+- `GET /users/me` → current user profile
+
+### Groups
+- `POST /groups` → `{name}` → creates group, creator auto-joined as member, returns group + invite_code
+- `GET /groups` → list groups current user belongs to (paginated)
+- `GET /groups/{group_id}` → group detail + member list (403 if not a member)
+- `POST /groups/join` → `{invite_code}` → joins caller to that group
+- `GET /groups/{group_id}/balances` → `[{user_id, net_balance}]` (cached)
+- `GET /groups/{group_id}/simplify-debts` → `[{from_user, to_user, amount}]`
+
+### Expenses
+- `POST /groups/{group_id}/expenses` → create (body includes split_type + participant data per §4)
+- `GET /groups/{group_id}/expenses` → paginated list, query params: `?user_id=&start_date=&end_date=&page=&page_size=`
+- `GET /expenses/{expense_id}` → detail incl. splits
+- `PATCH /expenses/{expense_id}` → edit (requires `version` in body for optimistic lock)
+- `DELETE /expenses/{expense_id}` → soft or hard delete (pick one, hard delete is fine for v1)
+
+### Settlements
+- `POST /groups/{group_id}/settlements` → `{paid_to, amount}` → caller is `paid_by`
+- `GET /groups/{group_id}/settlements` → paginated history
+
+### Ops
+- `GET /health` → 200 `{status: "ok", db: "ok", redis: "ok"}` — check both dependencies actually respond
+- `GET /metrics` → basic counters (request count, latency histogram) — Prometheus format if you want to go further, plain JSON is fine for v1
+
+**Pagination convention**: `page` (default 1), `page_size` (default 20, max 100). Response envelope:
+```json
+{ "items": [...], "total": 137, "page": 1, "page_size": 20 }
+```
+
+**Standard status codes**: 200 read/update ok, 201 created, 204 deleted/no content, 400 malformed request, 401 unauthenticated, 403 authenticated but not authorized (not a group member), 404 not found, 409 conflict (optimistic lock / duplicate join), 422 validation error (Pydantic handles this automatically).
+
+Every request/response body should be a Pydantic model — this gives you free Swagger docs and free validation, which is exactly your dev-loop tool.
+
+---
+
+## 9. Redis Usage Summary
+
+| Purpose | Key pattern | Type |
+|---|---|---|
+| Balance cache | `balances:{group_id}` | STRING (JSON) |
+| Pub/Sub channel | `notifications` | Redis Pub/Sub channel |
+
+Event payload published on new expense / settlement:
+```json
+{ "event": "expense_created", "group_id": "...", "expense_id": "...", "actor": "..." }
+```
+The notification worker subscribes with `redis.pubsub()`, loops on `.listen()`, and logs a structured line per event (e.g. via `structlog`) simulating "email sent to group members."
+
+---
+
+## 10. Testing Strategy
+
+- **Unit tests** (`pytest`): `calculate_splits()` (all split types + rounding edge cases), balance calculation function, debt simplification algorithm (hand-verified fixtures).
+- **Integration tests**: spin up a test Postgres (via `pytest` fixture + Docker, or `testcontainers-python`) and a test Redis; hit real endpoints with `httpx.AsyncClient` against the FastAPI app; cover: register→login→create group→join→add expense→check balance→settle→check balance is zero.
+- **Concurrency test**: fire two simultaneous PATCHs at the same expense with the same `version`, assert one gets 200 and the other gets 409.
+
+---
+
+## 11. Docker & Local Dev
+
+- `core-api/Dockerfile`, `notification-worker/Dockerfile` — separate, minimal (python:3.12-slim base, non-root user, multi-stage build to keep image small).
+- `docker-compose.yml` at repo root spinning up: `postgres`, `redis`, `core-api`, `notification-worker`. Core API depends_on postgres+redis with healthchecks so it doesn't boot before DB is ready.
+- `.env.example` documenting all required env vars (`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, `JWT_ACCESS_EXPIRE_MIN`, etc.) — never commit a real `.env`.
+
+---
+
+## 12. CI/CD (GitHub Actions)
+
+`.github/workflows/ci.yml`:
+1. On push/PR: spin up Postgres+Redis as GitHub Actions services, run `pytest`.
+2. On merge to `main` only: build Docker image, push to Google Artifact Registry, deploy to Cloud Run (`gcloud run deploy`) using a service account key stored in GitHub Secrets.
+3. Two separate deploy jobs (core-api, notification-worker) since they're independent Cloud Run services.
+
+---
+
+## 13. GCP Deployment
+
+- **Cloud Run**: two services, core-api (public, HTTPS) and notification-worker (no HTTP needed — Cloud Run supports background/worker-style deployment, or alternatively run it as a small always-on job; simplest for v1 is a Cloud Run service with min-instances=1 that just runs the subscriber loop).
+- **Cloud SQL** (Postgres): private IP, connected to Cloud Run via the Cloud SQL Auth Proxy / Unix socket connector.
+- **Memorystore** (Redis): requires a Serverless VPC Connector since Memorystore isn't public — this is a real GCP networking concept worth understanding, not just clicking through.
+- **Secret Manager**: `JWT_SECRET`, `DATABASE_URL`, `REDIS_URL` all pulled at runtime via Cloud Run's native Secret Manager integration — never baked into the image or committed.
+
+---
+
+## 14. Suggested Build Order
+
+1. Repo scaffold + docker-compose (postgres, redis) + FastAPI skeleton with `/health`.
+2. Models + Alembic migrations for all tables.
+3. Auth (register/login/refresh/logout) — verify entirely via Swagger `/docs` "Authorize" button.
+4. Groups (create/join/list/detail).
+5. Expenses + `calculate_splits()` as a standalone unit-tested function first, then wire to the endpoint.
+6. Balance calculation (no cache yet) → verify manually against hand-computed examples.
+7. Add Redis caching + invalidation.
+8. Debt simplification algorithm + endpoint.
+9. Settlements endpoint.
+10. Optimistic locking on expense edit — write the concurrency test.
+11. Notification worker + Redis pub/sub wiring.
+12. Dockerize both services fully, confirm docker-compose up works end-to-end.
+13. GitHub Actions CI (tests only) first, then CD to Cloud Run once GCP project is set up.
+14. Observability pass — structured logging, `/metrics`.
+
+Build and verify each step against Swagger UI before moving to the next — don't jump ahead to infra until the core domain logic (splits, balances, debt simplification) is airtight and unit-tested, since that's the part with actual algorithmic risk.
