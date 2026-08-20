@@ -4,6 +4,8 @@ A Splitwise-style shared expense tracker — log group expenses, split them fair
 
 Built to demonstrate broad, hands-on backend and cloud engineering — not to reinvent the wheel. Every layer (auth, data modeling, caching, async messaging, containerization, CI/CD, cloud deployment) is implemented cleanly and intentionally, without hiding behind full microservices complexity.
 
+Backend built entirely by hand — no AI-generated code — using trial and error against Swagger UI and browser devtools, as a deliberate learning exercise in backend and cloud fundamentals.
+
 ---
 
 ## What it does
@@ -19,7 +21,7 @@ Built to demonstrate broad, hands-on backend and cloud engineering — not to re
 
 ```
                  ┌─────────────┐
-   Client ─────▶ │  Core API   │──────▶ PostgreSQL (Cloud SQL)
+   Client ─────▶ │  Core API   │──────▶ PostgreSQL
  (Swagger/curl)  │  (FastAPI)  │──────▶ Redis (cache + pub/sub)
                  └─────┬───────┘
                        │ publishes events
@@ -43,14 +45,14 @@ Two independently deployable services sharing one Postgres instance and one Redi
 | Layer | Choice |
 |---|---|
 | API framework | FastAPI |
-| Database | PostgreSQL |
+| Database | PostgreSQL, raw SQL schema (`sql/init.sql`) |
+| ORM | SQLAlchemy (sync, `psycopg2`) |
 | Caching / messaging | Redis (cache-aside + Pub/Sub) |
-| ORM | SQLAlchemy |
 | Auth | JWT access tokens + rotating refresh tokens, bcrypt password hashing |
-| Frontend | React |
+| Frontend | React (AI-assisted, kept separate from backend work) |
 | Containerization | Docker, docker-compose |
-| Cloud | Google Cloud Platform — Cloud Run, Cloud SQL, Memorystore, Secret Manager |
-| CI/CD | GitHub Actions |
+| Cloud (planned) | Google Cloud Platform — Cloud Run, Cloud SQL, Memorystore, Secret Manager |
+| CI/CD (planned) | GitHub Actions |
 
 ---
 
@@ -65,8 +67,8 @@ Two independently deployable services sharing one Postgres instance and one Redi
 
 ## Cloud / DevOps scope
 
-- Per-service Dockerfiles, single docker-compose for local dev
-- Deployment to Cloud Run (serverless containers) for both services
+- Per-service Dockerfiles (`backend/Dockerfile`, `frontend/Dockerfile`, `sql/Dockerfile`), single root `docker-compose.yml` for local dev
+- Deployment to Cloud Run (serverless containers) for core-api and notification-worker
 - Cloud SQL for Postgres, Memorystore for Redis
 - CI/CD via GitHub Actions — test → build → deploy on merge to `main`
 - Structured logging, health checks, and basic request metrics
@@ -86,18 +88,28 @@ Given a group's net balances, the app collapses an arbitrary tangle of who-owes-
 CashMap/
 ├── backend/
 │   ├── app/
-│   │   ├── authentication/   # JWT issuing, password hashing, auth dependency
-│   │   ├── database/         # DB engine/session, Redis client, ORM models
-│   │   ├── exceptions/       # custom exception handlers
-│   │   ├── middleware/       # request middleware
-│   │   └── routes/           # auth, groups, expenses, settlements, schemas
+│   │   ├── authentication/
+│   │   │   └── auth.py           # JWT issuing, password hashing, auth dependency
+│   │   ├── database/
+│   │   │   ├── database.py       # SQLAlchemy engine, SessionLocal, get_db
+│   │   │   ├── models.py         # ORM models
+│   │   │   └── redis.py          # Redis client
+│   │   ├── exceptions/
+│   │   │   └── customexe.py      # custom exception handlers
+│   │   ├── middleware/
+│   │   │   └── middle.py
+│   │   └── routes/
+│   │       ├── schemas.py        # Pydantic request/response models
+│   │       ├── groups.py
+│   │       ├── expenses.py
+│   │       └── settlements.py
 │   ├── Dockerfile
 │   ├── main.py
 │   └── requirements.txt
 ├── frontend/
 │   └── Dockerfile
 ├── sql/
-│   ├── init.sql               # schema DDL
+│   ├── init.sql                  # schema DDL, runs on first Postgres container startup
 │   └── Dockerfile
 ├── docker-compose.yml
 └── README.md
@@ -110,7 +122,7 @@ CashMap/
 ```bash
 git clone https://github.com/AnishAchutha05/CashMap.git
 cd CashMap
-cp backend/.env.example backend/.env   # fill in your own values
+# create backend/.env with DATABASE_URL, REDIS_URL, JWT_SECRET etc.
 docker-compose up --build
 ```
 
@@ -140,4 +152,4 @@ Deliberately out of scope, to keep this buildable solo without derailing focus: 
 
 ## Status
 
-Actively in development — backend built by hand (no AI-generated code) using trial and error against Swagger UI and browser devtools, as a deliberate learning exercise in backend and cloud engineering fundamentals.
+Actively in development. Schema and Docker scaffolding in place; migrations (Alembic) intentionally deferred until raw SQL + SQLAlchemy fundamentals are solid. Cloud deployment and CI/CD are planned, not yet wired up.
